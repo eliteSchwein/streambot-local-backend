@@ -5,96 +5,43 @@ pub mod config;
 mod server;
 mod twitch;
 
-use std::sync::RwLock;
-use crate::internal::log;
-use crate::abstracts::cache::{CacheResult, SharedCache};
-use crate::config::{CacheBackend, Config};
-use crate::cache::{FileCache, RedisCache, set_cache};
-use std::{sync::Arc, thread};
+use crate::{config::Config, internal::{log, state}};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub static STARTUP_STAGE: RwLock<&str> = RwLock::new("unknown");
-pub static BACKEND_READY: RwLock<bool> = RwLock::new(false);
-pub static IS_SAVING: RwLock<bool> = RwLock::new(false);
+
+// Used by the existing REST and WebSocket status endpoints.
+pub fn status() -> serde_json::Value { state::status() }
 
 #[tokio::main]
-async fn main() -> CacheResult<()> {
+async fn main() -> crate::abstracts::cache::CacheResult<()> {
     log::success(&format!("Starting Streamding Backend V{}...", VERSION));
-
-    // Optional root .env: omitted settings retain their defaults.
     let config = Config::load()?;
-    initialize(false, &config).await
+    initialize(&config).await
 }
 
-/// Starts the backend infrastructure and keeps it alive until shutdown.
-/// The `reload` flag is reserved for the future reload lifecycle.
-pub async fn initialize(reload: bool, config: &Config) -> CacheResult<()> {
-    if reload {
-        // TODO: stop/reinitialize services when reload support is implemented.
-        log::notice("Backend reinitialization requested");
-    }
+async fn initialize(config: &Config) -> crate::abstracts::cache::CacheResult<()> {
+    state::reset();
+    state::set_stage("loading_cache");
+    cache::init(config).await?;
 
-    *IS_SAVING.write().unwrap() = false;
-    *BACKEND_READY.write().unwrap() = false;
-    *STARTUP_STAGE.write().unwrap() = "loading_cache";
+    state::set_stage("loading_config");
+    // Keep the watcher alive until all services have stopped.
+    let _configuration = config::init().await?;
 
-    // Cache must be ready before the config-file manager populates it.
-    let cache = init_cache(config).await?;
-    set_cache(cache).map_err(std::io::Error::other)?;
-    log::success("Cache initialized");
+    state::set_stage("loading_web_content");
+    let mut servers = server::init(config)?;
 
-    let configs = crate::config::file::init_config_files();
-    let _settings_watcher = crate::config::watcher::watch_settings(configs.clone())?;
-    let count = configs.read_all_configs().await?;
-    log::success(&format!("Loaded {count} configuration files"));
-
-    // Twitch has its own dedicated OS thread and single-threaded Tokio runtime.
-    // Connection/auth validation must not delay REST/WS startup.
-    *STARTUP_STAGE.write().unwrap() = "connecting_twitch";
-    let (twitch_shutdown_tx, twitch_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let (twitch_exit_tx, mut twitch_exit_rx) = tokio::sync::mpsc::unbounded_channel::<std::io::Result<()>>();
-    let twitch_config = config.twitch.clone();
-    let cloud_config = config.cloud.clone();
-    let twitch_thread = thread::Builder::new().name("streambot-twitch".into()).spawn(move || {
-        let result = run_twitch_thread(twitch_config, cloud_config, twitch_shutdown_rx);
-        let _ = twitch_exit_tx.send(result);
-    })?;
-
-    *STARTUP_STAGE.write().unwrap() = "loading_web_content";
-
-    // Dedicated OS thread + Tokio runtime for each server.
-    let (server_exit_tx, mut server_exit_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(&'static str, std::io::Result<()>)>();
-    let (rest_shutdown_tx, rest_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-    let rest_config = config.server.clone();
-    let rest_exits = server_exit_tx.clone();
-    let rest_thread = thread::Builder::new()
-        .name("streambot-rest".into())
-        .spawn(move || {
-            let result = run_server_thread(server::rest::run(rest_config), rest_shutdown_rx);
-            let _ = rest_exits.send(("REST", result));
-        })?;
-
-    let ws_config = config.server.clone();
-    let ws_thread = match thread::Builder::new()
-        .name("streambot-websocket".into())
-        .spawn(move || {
-            let result = run_server_thread(server::websocket::run(ws_config), ws_shutdown_rx);
-            let _ = server_exit_tx.send(("WebSocket", result));
-        }) {
-        Ok(thread) => thread,
+    state::set_stage("starting_twitch_bot");
+    let mut twitch = match twitch::init(config) {
+        Ok(handle) => handle,
         Err(error) => {
-            let _ = rest_shutdown_tx.send(());
-            let _ = tokio::task::spawn_blocking(move || rest_thread.join()).await;
+            servers.shutdown().await?;
             return Err(error.into());
         }
     };
 
-    server::registry::notify("notify_twitch_connection", serde_json::json!({"state":"connecting"}));
-    *STARTUP_STAGE.write().unwrap() = "ready";
-    *BACKEND_READY.write().unwrap() = true;
+    state::set_stage("ready");
+    state::set_ready(true);
     log::success("Backend initialized");
 
     tokio::select! {
@@ -102,111 +49,23 @@ pub async fn initialize(reload: bool, config: &Config) -> CacheResult<()> {
             signal?;
             log::notice("Shutdown requested");
         }
-        twitch_exit = twitch_exit_rx.recv() => {
-            log::warn(&format!("Twitch worker stopped: {twitch_exit:?}"));
-        }
-        exited = server_exit_rx.recv() => {
+        exited = servers.wait_for_exit() => {
             match exited {
                 Some((name, Ok(()))) => log::warn(&format!("{name} server stopped unexpectedly")),
                 Some((name, Err(error))) => log::error(&format!("{name} server failed: {error}")),
                 None => log::warn("Server threads stopped"),
             }
         }
+        exited = twitch.wait_for_exit() => {
+            log::warn(&format!("Twitch worker stopped unexpectedly: {exited:?}"));
+        }
     }
 
-    *BACKEND_READY.write().unwrap() = false;
-    *STARTUP_STAGE.write().unwrap() = "stopping";
-    let _ = twitch_shutdown_tx.send(());
-    let _ = rest_shutdown_tx.send(());
-    let _ = ws_shutdown_tx.send(());
-    tokio::task::spawn_blocking(move || {
-        let _ = rest_thread.join();
-        let _ = ws_thread.join();
-        let _ = twitch_thread.join();
-    }).await?;
-
-    *STARTUP_STAGE.write().unwrap() = "stopped";
+    state::set_ready(false);
+    state::set_stage("stopping");
+    // Stop workers before dropping config/cache resources.
+    twitch.shutdown().await?;
+    servers.shutdown().await?;
+    state::set_stage("stopped");
     Ok(())
-}
-
-async fn init_cache(config: &Config) -> CacheResult<SharedCache> {
-    match config.cache.backend {
-        CacheBackend::Redis => {
-            log::info("Cache backend: Redis");
-            match RedisCache::connect(&config.cache.redis_url, &config.cache.redis_prefix).await {
-                Ok(redis) => Ok(Arc::new(redis)),
-                Err(error) => {
-                    log::warn(&format!("Redis unavailable: {error}"));
-                    log::warn(&format!(
-                        "Falling back to file cache: {}",
-                        config.cache.file_path.display()
-                    ));
-                    let file = FileCache::open(&config.cache.file_path).await?;
-                    log::success("File cache initialized (Redis fallback)");
-                    Ok(Arc::new(file))
-                }
-            }
-        }
-        CacheBackend::File => {
-            log::info("Cache backend: File");
-            Ok(Arc::new(FileCache::open(&config.cache.file_path).await?))
-        }
-    }
-}
-
-// Shared status payload for REST and WebSocket servers.
-pub fn status() -> serde_json::Value {
-    serde_json::json!({
-        "version": VERSION,
-        "bootup_stage": *STARTUP_STAGE.read().unwrap(),
-        "ready": *BACKEND_READY.read().unwrap(),
-    })
-}
-
-// Run one long-lived server future on its own thread/runtime.
-fn run_server_thread<F>(server: F, mut shutdown: tokio::sync::oneshot::Receiver<()>) -> std::io::Result<()>
-where
-    F: std::future::Future<Output = std::io::Result<()>>,
-{
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        tokio::select! {
-            result = server => result,
-            _ = &mut shutdown => Ok(()),
-        }
-    })
-}
-
-fn run_twitch_thread(
-    twitch: crate::config::TwitchConfig,
-    cloud: crate::config::CloudConfig,
-    mut shutdown: tokio::sync::oneshot::Receiver<()>,
-) -> std::io::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(async move {
-        let client = tokio::select! {
-            result = twitch::TwitchClient::connect(&twitch, &cloud) => match result {
-                Ok(Some(client)) => {
-                    server::registry::notify("notify_twitch_connection", serde_json::json!({"state":"connected","connected":true}));
-                    Some(client)
-                }
-                Ok(None) => {
-                    server::registry::notify("notify_twitch_connection", serde_json::json!({"state":"auth_required","connected":false}));
-                    None
-                }
-                Err(error) => {
-                    log::warn(&format!("Twitch initialization failed: {error}"));
-                    server::registry::notify("notify_twitch_connection", serde_json::json!({"state":"error","connected":false,"message":error.to_string()}));
-                    None
-                }
-            },
-            _ = &mut shutdown => return Ok(()),
-        };
-        // Keep the runtime and client alive for upcoming Twitch polling / event tasks.
-        let _client = client;
-        let _ = shutdown.await;
-        Ok(())
-    })
 }

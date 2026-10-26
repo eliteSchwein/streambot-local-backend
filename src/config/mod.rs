@@ -225,3 +225,17 @@ mod tests {
         assert!(Config::parse("[twitch]\nclient_id: abc\n").is_ok());
     }
 }
+
+
+/// Owns the live filesystem watcher; dropping it stops watching.
+pub struct ConfigService {
+    _watcher: notify::RecommendedWatcher,
+}
+
+pub async fn init() -> crate::abstracts::cache::CacheResult<ConfigService> {
+    let manager = file::init_config_files();
+    let count = manager.read_all_configs().await?;
+    crate::internal::log::success(&format!("Loaded {count} configuration files"));
+    let watcher = watcher::watch_settings(manager)?;
+    Ok(ConfigService { _watcher: watcher })
+}
