@@ -35,7 +35,7 @@ pub async fn initialize(reload: bool, config: &Config) -> CacheResult<()> {
 
     *IS_SAVING.write().unwrap() = false;
     *BACKEND_READY.write().unwrap() = false;
-    *STARTUP_STAGE.write().unwrap() = "initializing";
+    *STARTUP_STAGE.write().unwrap() = "loading_cache";
 
     // Cache must be ready before the config-file manager populates it.
     let cache = init_cache(config).await?;
@@ -47,7 +47,7 @@ pub async fn initialize(reload: bool, config: &Config) -> CacheResult<()> {
     let count = configs.read_all_configs().await?;
     log::success(&format!("Loaded {count} configuration files"));
 
-    *STARTUP_STAGE.write().unwrap() = "starting_servers";
+    *STARTUP_STAGE.write().unwrap() = "loading_web_content";
 
     // Dedicated OS thread + Tokio runtime for each server.
     let (server_exit_tx, mut server_exit_rx) =
