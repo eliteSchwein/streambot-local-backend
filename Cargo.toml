@@ -15,8 +15,10 @@ twitch_oauth2 = "0.17.1"
 ws2812-spi = "0.5.1"
 chrono = "0.4.45"
 redis = { version = "1.8.0", features = ["tokio-comp", "connection-manager"] }
-tokio = { version = "1.54.1", features = ["fs", "rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.54.1", features = ["fs", "rt", "rt-multi-thread", "macros", "signal"] }
 async-trait = "0.1.92"
 serde = { version = "1.0.229", features = ["derive"] }
 notify = "8.2.1"
 anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["ws"] }
+tower-http = { version = "0.7.1", features = ["cors", "fs"] }

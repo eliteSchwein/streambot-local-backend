@@ -28,9 +28,39 @@ impl Default for CacheConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub restport: u16,
+    pub wsport: u16,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self { restport: 8105, wsport: 8100 }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TwitchConfig {
+    pub test_mode: bool,
+    pub client_id: String,
+    pub client_secret: String, // server-side only, never returned by /config.json
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApiWebsiteConfig {
+    pub url: String,
+    pub api_slug: String,
+    pub token: String, // server-side only
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub cache: CacheConfig,
+    pub server: ServerConfig,
+    pub twitch: TwitchConfig,
+    pub api_website: ApiWebsiteConfig,
 }
 
 impl Config {
@@ -85,6 +115,46 @@ impl Config {
                     _ => {} // Other cache settings can be added later.
                 }
             }
+            if section == "server" {
+                let parsed_port = || -> io::Result<u16> {
+                    let port = value.parse::<u16>().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData,
+                            format!("Invalid server port on line {}: {value}", index + 1))
+                    })?;
+                    if port == 0 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            format!("Server port must be greater than zero on line {}", index + 1)));
+                    }
+                    Ok(port)
+                };
+                match key.as_str() {
+                    "restport" => result.server.restport = parsed_port()?,
+                    "wsport" => result.server.wsport = parsed_port()?,
+                    _ => {}
+                }
+            }
+            match section.as_str() {
+                "twitch" => match key.as_str() {
+                    "test_mode" => result.twitch.test_mode = match value.to_ascii_lowercase().as_str() {
+                        "true" | "yes" | "1" | "on" => true,
+                        "false" | "no" | "0" | "off" => false,
+                        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid twitch.test_mode on line {}", index + 1))),
+                    },
+                    "client_id" => result.twitch.client_id = value.into(),
+                    "client_secret" => result.twitch.client_secret = value.into(),
+                    "channels" => result.twitch.channels = value.trim_matches(|c| c == '[' || c == ']')
+                        .split(',').map(|c| c.trim().trim_matches('"').trim_matches('\'').to_string())
+                        .filter(|c| !c.is_empty()).collect(),
+                    _ => {}
+                },
+                "api website" => match key.as_str() {
+                    "url" => result.api_website.url = value.into(),
+                    "api_slug" => result.api_website.api_slug = value.into(),
+                    "token" => result.api_website.token = value.into(),
+                    _ => {}
+                },
+                _ => {}
+            }
             // Unknown sections belong to future components.
         }
         Ok(result)
@@ -94,6 +164,26 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_defaults() {
+        let c = Config::parse("").unwrap();
+        assert_eq!(c.server.restport, 8105);
+        assert_eq!(c.server.wsport, 8100);
+    }
+
+    #[test]
+    fn server_overrides() {
+        let c = Config::parse("[server]\nrestport: 9000\nwsport: 9001\n").unwrap();
+        assert_eq!(c.server.restport, 9000);
+        assert_eq!(c.server.wsport, 9001);
+    }
+
+    #[test]
+    fn rejects_invalid_port() {
+        assert!(Config::parse("[server]\nrestport: abc\n").is_err());
+        assert!(Config::parse("[server]\nwsport: 0\n").is_err());
+    }
 
     #[test]
     fn defaults_to_redis() {
