@@ -3,6 +3,7 @@ mod cache;
 pub mod abstracts;
 pub mod config;
 mod server;
+mod twitch;
 
 use std::sync::RwLock;
 use crate::internal::log;
@@ -46,6 +47,16 @@ pub async fn initialize(reload: bool, config: &Config) -> CacheResult<()> {
     let _settings_watcher = crate::config::watcher::watch_settings(configs.clone())?;
     let count = configs.read_all_configs().await?;
     log::success(&format!("Loaded {count} configuration files"));
+
+    *STARTUP_STAGE.write().unwrap() = "connecting_twitch";
+    let twitch = match twitch::TwitchClient::connect(&config.twitch, &config.cloud).await {
+        Ok(client) => client,
+        Err(error) => {
+            log::warn(&format!("Twitch initialization failed; backend will continue: {error}"));
+            None
+        }
+    };
+    let _twitch = twitch; // TODO: register shared Twitch manager when services are introduced.
 
     *STARTUP_STAGE.write().unwrap() = "loading_web_content";
 

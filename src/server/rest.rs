@@ -1,4 +1,6 @@
-use axum::{http::{header, Method, StatusCode}, routing::get, Router};
+use axum::{extract::Query, http::{header, Method, StatusCode}, response::{IntoResponse, Redirect}, routing::get, Router};
+use serde::Deserialize;
+use crate::twitch::auth::{AuthKind, TwitchAuth};
 use std::{net::SocketAddr, path::PathBuf};
 use tower_http::{cors::{Any, CorsLayer}, services::{ServeDir, ServeFile}};
 use crate::{config::{Config, ServerConfig}, internal::log, status};
@@ -59,6 +61,62 @@ async fn public_config_endpoint() -> Json<Value> {
     }))
 }
 
+#[derive(Deserialize)]
+struct TwitchCallbackParams {
+    code: Option<String>, exchange_code: Option<String>, auth_code: Option<String>,
+    #[serde(rename="type")] auth_type: Option<String>,
+    cloud_auth: Option<String>, status: Option<String>, error: Option<String>,
+}
+
+async fn twitch_auth_control() -> impl IntoResponse { cloud_auth_redirect(AuthKind::Control) }
+async fn twitch_auth_message() -> impl IntoResponse { cloud_auth_redirect(AuthKind::Message) }
+fn cloud_auth_redirect(kind: AuthKind) -> axum::response::Response {
+    let config = match Config::load() {
+        Ok(v) => v, Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    };
+    let auth = TwitchAuth::new(&config.twitch, &config.cloud);
+    // Relative callback URL is intentionally NOT constructed from an untrusted Host header.
+    // Set STREAMDING_PUBLIC_URL to the externally reachable backend base URL (http://localhost:8105 by default).
+    let origin = std::env::var("STREAMDING_PUBLIC_URL")
+        .unwrap_or_else(|_| format!("http://localhost:{}", config.server.restport));
+    let callback = format!("{}/auth/twitch/callback?type={}", origin.trim_end_matches('/'), kind.as_str());
+    match auth.cloud_auth_url(kind, &callback) {
+        Ok(url) => Redirect::temporary(&url).into_response(),
+        Err(err) => { log::warn(&format!("Twitch cloud authorization URL failed: {err}")); StatusCode::INTERNAL_SERVER_ERROR.into_response() }
+    }
+}
+
+async fn twitch_auth_callback(Query(params): Query<TwitchCallbackParams>) -> impl IntoResponse {
+    if params.status.as_deref().is_some_and(|s| s != "success") || params.error.is_some() {
+        return (StatusCode::BAD_REQUEST, "Twitch cloud authentication failed").into_response();
+    }
+    let Some(code) = params.code.or(params.exchange_code).or(params.auth_code) else {
+        return (StatusCode::BAD_REQUEST, "Missing cloud Twitch exchange code").into_response();
+    };
+    let kind = if params.auth_type.as_deref() == Some("message") || matches!(params.cloud_auth.as_deref(), Some("message" | "message-bot")) {
+        AuthKind::Message
+    } else { AuthKind::Control };
+    let config = match Config::load() {
+        Ok(v) => v, Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    };
+    let mut auth = TwitchAuth::new(&config.twitch, &config.cloud);
+    if let Err(err) = auth.load().await {
+        log::warn(&format!("Failed reading Twitch integration: {err}"));
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    match auth.exchange_code(kind, &code).await {
+        Ok(_) => {
+            log::success(&format!("Cloud Twitch {} authorization saved", kind.as_str()));
+            // TODO: Notify/reconnect the running Twitch client without restarting the backend.
+            (StatusCode::OK, format!("Twitch {} authentication successful. Restart the backend to connect.", kind.as_str())).into_response()
+        }
+        Err(err) => {
+            log::warn(&format!("Cloud Twitch exchange failed: {err}"));
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
 pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -68,6 +126,9 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
         .route("/api/status", get(status_endpoint))
         .route("/status", get(status_endpoint))
         .route("/config.json", get(public_config_endpoint))
+        .route("/auth/twitch/control", get(twitch_auth_control))
+        .route("/auth/twitch/message", get(twitch_auth_message))
+        .route("/auth/twitch/callback", get(twitch_auth_callback))
         .merge(static_router())
         .layer(cors);
     let addr = SocketAddr::from(([0,0,0,0], config.restport));

@@ -55,12 +55,19 @@ pub struct ApiWebsiteConfig {
     pub token: String, // server-side only
 }
 
+#[derive(Debug, Clone)]
+pub struct CloudConfig { pub url: String }
+impl Default for CloudConfig {
+    fn default() -> Self { Self { url: "https://cloud.streamding.dev".into() } }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub cache: CacheConfig,
     pub server: ServerConfig,
     pub twitch: TwitchConfig,
     pub api_website: ApiWebsiteConfig,
+    pub cloud: CloudConfig,
 }
 
 impl Config {
@@ -147,6 +154,10 @@ impl Config {
                         .filter(|c| !c.is_empty()).collect(),
                     _ => {}
                 },
+                "cloud" => match key.as_str() {
+                    "url" => result.cloud.url = value.trim_end_matches('/').to_owned(),
+                    _ => {}
+                },
                 "api website" => match key.as_str() {
                     "url" => result.api_website.url = value.into(),
                     "api_slug" => result.api_website.api_slug = value.into(),
@@ -164,6 +175,12 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_config() {
+        assert_eq!(Config::parse("").unwrap().cloud.url, "https://cloud.streamding.dev");
+        assert_eq!(Config::parse("[cloud]\nurl: 'http://localhost:8080/'\n").unwrap().cloud.url, "http://localhost:8080");
+    }
 
     #[test]
     fn server_defaults() {
