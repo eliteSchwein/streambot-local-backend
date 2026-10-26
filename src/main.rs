@@ -48,15 +48,17 @@ pub async fn initialize(reload: bool, config: &Config) -> CacheResult<()> {
     let count = configs.read_all_configs().await?;
     log::success(&format!("Loaded {count} configuration files"));
 
+    // Twitch has its own dedicated OS thread and single-threaded Tokio runtime.
+    // Connection/auth validation must not delay REST/WS startup.
     *STARTUP_STAGE.write().unwrap() = "connecting_twitch";
-    let twitch = match twitch::TwitchClient::connect(&config.twitch, &config.cloud).await {
-        Ok(client) => client,
-        Err(error) => {
-            log::warn(&format!("Twitch initialization failed; backend will continue: {error}"));
-            None
-        }
-    };
-    let _twitch = twitch; // TODO: register shared Twitch manager when services are introduced.
+    let (twitch_shutdown_tx, twitch_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (twitch_exit_tx, mut twitch_exit_rx) = tokio::sync::mpsc::unbounded_channel::<std::io::Result<()>>();
+    let twitch_config = config.twitch.clone();
+    let cloud_config = config.cloud.clone();
+    let twitch_thread = thread::Builder::new().name("streambot-twitch".into()).spawn(move || {
+        let result = run_twitch_thread(twitch_config, cloud_config, twitch_shutdown_rx);
+        let _ = twitch_exit_tx.send(result);
+    })?;
 
     *STARTUP_STAGE.write().unwrap() = "loading_web_content";
 
@@ -90,6 +92,7 @@ pub async fn initialize(reload: bool, config: &Config) -> CacheResult<()> {
         }
     };
 
+    server::registry::notify("notify_twitch_connection", serde_json::json!({"state":"connecting"}));
     *STARTUP_STAGE.write().unwrap() = "ready";
     *BACKEND_READY.write().unwrap() = true;
     log::success("Backend initialized");
@@ -98,6 +101,9 @@ pub async fn initialize(reload: bool, config: &Config) -> CacheResult<()> {
         signal = tokio::signal::ctrl_c() => {
             signal?;
             log::notice("Shutdown requested");
+        }
+        twitch_exit = twitch_exit_rx.recv() => {
+            log::warn(&format!("Twitch worker stopped: {twitch_exit:?}"));
         }
         exited = server_exit_rx.recv() => {
             match exited {
@@ -110,11 +116,13 @@ pub async fn initialize(reload: bool, config: &Config) -> CacheResult<()> {
 
     *BACKEND_READY.write().unwrap() = false;
     *STARTUP_STAGE.write().unwrap() = "stopping";
+    let _ = twitch_shutdown_tx.send(());
     let _ = rest_shutdown_tx.send(());
     let _ = ws_shutdown_tx.send(());
     tokio::task::spawn_blocking(move || {
         let _ = rest_thread.join();
         let _ = ws_thread.join();
+        let _ = twitch_thread.join();
     }).await?;
 
     *STARTUP_STAGE.write().unwrap() = "stopped";
@@ -168,5 +176,37 @@ where
             result = server => result,
             _ = &mut shutdown => Ok(()),
         }
+    })
+}
+
+fn run_twitch_thread(
+    twitch: crate::config::TwitchConfig,
+    cloud: crate::config::CloudConfig,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    runtime.block_on(async move {
+        let client = tokio::select! {
+            result = twitch::TwitchClient::connect(&twitch, &cloud) => match result {
+                Ok(Some(client)) => {
+                    server::registry::notify("notify_twitch_connection", serde_json::json!({"state":"connected","connected":true}));
+                    Some(client)
+                }
+                Ok(None) => {
+                    server::registry::notify("notify_twitch_connection", serde_json::json!({"state":"auth_required","connected":false}));
+                    None
+                }
+                Err(error) => {
+                    log::warn(&format!("Twitch initialization failed: {error}"));
+                    server::registry::notify("notify_twitch_connection", serde_json::json!({"state":"error","connected":false,"message":error.to_string()}));
+                    None
+                }
+            },
+            _ = &mut shutdown => return Ok(()),
+        };
+        // Keep the runtime and client alive for upcoming Twitch polling / event tasks.
+        let _client = client;
+        let _ = shutdown.await;
+        Ok(())
     })
 }

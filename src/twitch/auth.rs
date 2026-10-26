@@ -45,11 +45,7 @@ impl TwitchAuth {
         // Prefer explicitly configured credentials, otherwise use the client ID
         // embedded in cloud-issued OAuth tokens (Twurple integrations.json format).
         fn first_nonempty<'a>(values: &[Option<&'a str>]) -> Option<&'a str> {
-            values
-                .iter()
-                .flatten()
-                .copied()
-                .find(|value| !value.trim().is_empty())
+            values.iter().flatten().copied().find(|value| !value.trim().is_empty())
         }
         if let Some(id) = first_nonempty(&[
             twitch["client_id"].as_str(),
