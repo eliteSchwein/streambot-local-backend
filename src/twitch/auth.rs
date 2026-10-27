@@ -2,9 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use reqwest::Client as HttpClient;
-use std::{path::PathBuf, sync::Arc};
-use tokio::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthKind { Control, Message }
@@ -29,13 +27,12 @@ pub struct TwitchAuth {
     pub client_id: String,
     pub client_secret: String,
     pub cloud_url: String,
-    write_lock: Arc<Mutex<()>>,
 }
 
 impl TwitchAuth {
     pub fn new(config: &crate::config::TwitchConfig, cloud: &crate::config::CloudConfig) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        Self { path: home.join(".config/streambot/integrations.json"), client_id: config.client_id.clone(), client_secret: config.client_secret.clone(), cloud_url: cloud.url.trim_end_matches('/').to_owned(), write_lock: Arc::new(Mutex::new(())) }
+        Self { path: home.join(".config/streambot/integrations.json"), client_id: config.client_id.clone(), client_secret: config.client_secret.clone(), cloud_url: cloud.url.trim_end_matches('/').to_owned() }
     }
     pub async fn load(&mut self) -> Result<()> {
         let contents = match tokio::fs::read_to_string(&self.path).await {
@@ -119,64 +116,7 @@ impl TwitchAuth {
         Ok(token)
     }
 
-    /// Cloud handles refresh for credentials issued through its initial OAuth flow.
-    /// Separate endpoints preserve the control/message auth separation.
-    pub async fn refresh_token(&self, kind: AuthKind, previous: &StoredToken) -> Result<StoredToken> {
-        if previous.refresh_token.trim().is_empty() {
-            bail!("Twitch {} token has no refresh token; reauthorize through Cloud", kind.as_str());
-        }
-        let client_id = previous.client_id.as_deref().filter(|id| !id.is_empty())
-            .unwrap_or(self.require_client_id()?);
-        let url = format!("{}/api/v1/twitch/refresh/{}", self.cloud_url, kind.as_str());
-        // Match the existing camelCase integrations.json representation while
-        // including snake_case keys for OAuth-style Cloud handlers.
-        // TODO: confirm the Cloud backend's exact request schema and authentication mechanism.
-        let payload = json!({
-            "refreshToken": previous.refresh_token,
-            "refresh_token": previous.refresh_token,
-            "clientId": client_id,
-            "client_id": client_id,
-        });
-        let response = HttpClient::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()?
-            .post(url)
-            .json(&payload)
-            .send().await
-            .with_context(|| format!("Cloud Twitch {} refresh request failed", kind.as_str()))?;
-        let status = response.status();
-        let body: Value = response.json().await
-            .context("Cloud Twitch refresh returned invalid JSON")?;
-        if !status.is_success() {
-            let detail = body.get("message")
-                .or_else(|| body.get("error"))
-                .and_then(Value::as_str)
-                .unwrap_or("Cloud rejected Twitch refresh");
-            bail!("Cloud Twitch {} refresh failed (HTTP {status}): {detail}", kind.as_str());
-        }
-        let root = body.get("data").unwrap_or(&body);
-        let raw = root.get("token").or_else(|| root.get("twitch")).unwrap_or(root);
-        let mut updated: StoredToken = serde_json::from_value(raw.clone())
-            .context("invalid Cloud Twitch refresh token payload")?;
-        if updated.access_token.is_empty() {
-            bail!("Cloud Twitch {} refresh returned no access token", kind.as_str());
-        }
-        if updated.refresh_token.is_empty() {
-            updated.refresh_token = previous.refresh_token.clone();
-        }
-        if updated.client_id.as_deref().unwrap_or("").is_empty() {
-            updated.client_id = Some(client_id.to_owned());
-        }
-        if updated.user_id.is_none() { updated.user_id = previous.user_id.clone(); }
-        if updated.login.is_none() { updated.login = previous.login.clone(); }
-        if updated.scope.is_empty() { updated.scope = previous.scope.clone(); }
-        updated.obtainment_timestamp = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64);
-        self.store_token(kind, &updated).await?;
-        Ok(updated)
-    }
-
     pub async fn store_token(&self, kind: AuthKind, token: &StoredToken) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
         let contents = match tokio::fs::read_to_string(&self.path).await {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".into(),
@@ -196,5 +136,6 @@ impl TwitchAuth {
         }
         Ok(())
     }
-    // TODO: Coordinate refreshes with any other process also writing integrations.json.
+    // TODO: Cloud-managed token renewal/reauthorization before token expiry.
+    // TODO: Serialize concurrent auth callbacks to avoid overwriting token changes.
 }
