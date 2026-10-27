@@ -21,10 +21,15 @@ impl TwitchClient {
         auth.require_client_id()?;
         let http = HttpClient::builder().timeout(std::time::Duration::from_secs(15)).build()?;
         let mut instance = Self {
-            http, auth, control_token: control.access_token,
+            http, auth, control_token: control.access_token.clone(),
             message_token: None, channels: config.channels.clone(),
         };
-        instance.validate_token(&instance.control_token).await.context("Twitch control auth validation failed")?;
+        if let Err(error) = instance.validate_token(&instance.control_token).await {
+            crate::internal::log::warn(&format!("Twitch control token validation failed: {error:#}; refreshing"));
+            let refreshed = instance.auth.refresh_token(AuthKind::Control, &control).await?;
+            instance.validate_token(&refreshed.access_token).await.context("Refreshed Twitch control auth validation failed")?;
+            instance.control_token = refreshed.access_token;
+        }
         crate::internal::log::success("Twitch control auth validated");
         if let Some(message) = instance.auth.token(AuthKind::Message).await? {
             match instance.validate_token(&message.access_token).await {
@@ -32,7 +37,16 @@ impl TwitchClient {
                     instance.message_token = Some(message.access_token);
                     crate::internal::log::success("Twitch message auth validated");
                 }
-                Err(e) => crate::internal::log::warn(&format!("Twitch message auth unavailable; using control auth: {e}")),
+                Err(e) => {
+                    crate::internal::log::warn(&format!("Twitch message token validation failed: {e:#}; refreshing"));
+                    match instance.auth.refresh_token(AuthKind::Message, &message).await {
+                        Ok(refreshed) => match instance.validate_token(&refreshed.access_token).await {
+                            Ok(_) => { instance.message_token = Some(refreshed.access_token); crate::internal::log::success("Twitch message auth refreshed"); }
+                            Err(e) => crate::internal::log::warn(&format!("Refreshed Twitch message auth invalid; using control: {e:#}")),
+                        },
+                        Err(e) => crate::internal::log::warn(&format!("Twitch message refresh failed; using control: {e:#}")),
+                    }
+                },
             }
         }
         // TODO: Chat listener and command registration (TwitchCommands.ts).
