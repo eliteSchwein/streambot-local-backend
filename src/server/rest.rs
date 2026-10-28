@@ -117,20 +117,6 @@ async fn twitch_auth_callback(Query(params): Query<TwitchCallbackParams>) -> imp
     }
 }
 
-async fn category_list() -> impl IntoResponse { category_call("category_library_list", json!({})) }
-async fn category_get(Json(data): Json<Value>) -> impl IntoResponse { category_call("category_library_get", data) }
-async fn category_save(Json(data): Json<Value>) -> impl IntoResponse { category_call("category_library_save", data) }
-async fn category_delete(Json(data): Json<Value>) -> impl IntoResponse { category_call("category_library_delete", data) }
-async fn category_activate(Json(data): Json<Value>) -> impl IntoResponse { category_call("category_library_activate", data) }
-async fn category_refresh(Json(data): Json<Value>) -> impl IntoResponse { category_call("category_library_refresh", data) }
-async fn category_import(Json(data): Json<Value>) -> impl IntoResponse { category_call("category_library_import_website", data) }
-fn category_call(method: &str, params: Value) -> impl IntoResponse {
-    match crate::category_library::dispatch(method, params) {
-        Ok(data) => respond(StatusCode::OK, data).into_response(),
-        Err(message) => respond(StatusCode::BAD_REQUEST, json!({"error":message})).into_response()
-    }
-}
-
 pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -138,13 +124,6 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
         .allow_headers([header::CONTENT_TYPE]);
     let app = Router::new()
         .route("/api/status", get(status_endpoint))
-        .route("/api/category-library/list", get(category_list).post(category_list))
-        .route("/api/category-library/get", post(category_get))
-        .route("/api/category-library/save", post(category_save))
-        .route("/api/category-library/delete", post(category_delete))
-        .route("/api/category-library/activate", post(category_activate))
-        .route("/api/category-library/refresh", post(category_refresh))
-        .route("/api/category-library/import-website", post(category_import))
         .route("/status", get(status_endpoint))
         .route("/config.json", get(public_config_endpoint))
         .route("/auth/twitch/control", get(twitch_auth_control))

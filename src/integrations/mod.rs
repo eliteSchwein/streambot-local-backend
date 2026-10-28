@@ -1,7 +1,4 @@
 pub mod yolobox;
-pub mod ollama;
-pub mod cloud;
-pub mod obs;
 
 use std::{io, thread};
 use tokio::sync::oneshot;
@@ -37,23 +34,14 @@ impl Worker {
     }
 }
 
-pub struct Integrations { pub cloud: cloud::CloudService, pub ollama: ollama::OllamaService, pub yolobox: yolobox::YoloboxService, pub obs: obs::ObsService }
-pub fn init(config: &crate::config::Config) -> io::Result<Integrations> {
-    let cloud = cloud::init(config)?;
-    crate::internal::state::set_stage("starting_ollama");
-    let ollama = match ollama::init() { Ok(x) => x, Err(e) => { return Err(e); } };
+pub struct Integrations { pub yolobox: yolobox::YoloboxService }
+pub fn init(_config: &crate::config::Config) -> io::Result<Integrations> {
     let yolobox = yolobox::init()?;
-    crate::internal::state::set_stage("connecting_obs");
-    let obs = obs::init()?;
-    Ok(Integrations { cloud, ollama, yolobox, obs })
+    Ok(Integrations { yolobox })
 }
 impl Integrations {
     pub async fn shutdown(&mut self) -> io::Result<()> {
-        self.obs.shutdown().await?;
-        self.yolobox.shutdown().await?;
-        self.cloud.shutdown().await?;
-        self.ollama.shutdown().await?;
-        Ok(())
+        self.yolobox.shutdown().await
     }
 }
 

@@ -50,23 +50,8 @@ async fn handle_socket(mut socket: WebSocket) {
                                 let valid_request = request.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
                                     && id.as_ref().is_none_or(|id| id.is_null() || id.is_string() || id.is_number());
                                 if !valid_request {
-                                    if let Ok(request) = &incoming {
-                        if let Some(method) = request.get("method").and_then(Value::as_str) {
-                            if crate::category_library::is_method(method) {
-                                let result = crate::category_library::dispatch(method, request.get("params").cloned().unwrap_or(json!({})));
-                                if let Some(id) = request.get("id").cloned() {
-                                    let answer = match result {
-                                        Ok(data) => rpc::success(id, data),
-                                        Err(err) => rpc::error(id, -32000, &err),
-                                    };
-                                    if !send_json(&mut socket, answer).await {break;}
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    if let Some(reply) = rpc::handle_text(text.as_str()) {
-                                        if !send_json(&mut socket, reply).await { break; }
+                                    if let Some(id) = id {
+                                        if !send_json(&mut socket, rpc::error(id, -32600, "Invalid Request")).await { break; }
                                     }
                                     continue;
                                 }
@@ -94,21 +79,6 @@ async fn handle_socket(mut socket: WebSocket) {
                                 }
                                 if let Some(id) = id {
                                     if !send_json(&mut socket, rpc::success(id, json!({"endpoints": endpoints.iter().collect::<Vec<_>>() }))).await { break; }
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    if let Ok(request) = &incoming {
-                        if let Some(method) = request.get("method").and_then(Value::as_str) {
-                            if crate::category_library::is_method(method) {
-                                let result = crate::category_library::dispatch(method, request.get("params").cloned().unwrap_or(json!({})));
-                                if let Some(id) = request.get("id").cloned() {
-                                    let answer = match result {
-                                        Ok(data) => rpc::success(id, data),
-                                        Err(err) => rpc::error(id, -32000, &err),
-                                    };
-                                    if !send_json(&mut socket, answer).await {break;}
                                 }
                                 continue;
                             }

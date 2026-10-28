@@ -4,7 +4,6 @@ pub mod abstracts;
 pub mod config;
 mod server;
 mod twitch;
-mod category_library;
 mod integrations;
 mod system;
 
@@ -30,9 +29,6 @@ async fn initialize(config: &Config) -> crate::abstracts::cache::CacheResult<()>
     state::set_stage("loading_config");
     // Keep the watcher alive until all services have stopped.
     let _configuration = config::init().await?;
-
-    state::set_stage("loading_category_library");
-    category_library::init().map_err(std::io::Error::other)?;
 
     state::set_stage("loading_web_content");
     let mut servers = server::init(config)?;
