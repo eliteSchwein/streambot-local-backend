@@ -4,7 +4,6 @@ pub mod abstracts;
 pub mod config;
 mod server;
 mod twitch;
-mod integrations;
 mod system;
 
 use crate::{config::Config, internal::{log, state}};
@@ -45,9 +44,6 @@ async fn initialize(config: &Config) -> crate::abstracts::cache::CacheResult<()>
         }
     };
 
-    state::set_stage("loading_integrations");
-    let mut integrations = integrations::init(config).map_err(std::io::Error::other)?;
-
     state::set_stage("ready");
     state::set_ready(true);
     log::success("Backend initialized");
@@ -73,7 +69,6 @@ async fn initialize(config: &Config) -> crate::abstracts::cache::CacheResult<()>
     state::set_stage("stopping");
     // Stop workers before dropping config/cache resources.
     system_updater.abort();
-    integrations.shutdown().await?;
     twitch.shutdown().await?;
     servers.shutdown().await?;
     state::set_stage("stopped");

@@ -99,3 +99,35 @@ mod tests {
         assert_eq!(result[0]["id"], 2);
     }
 }
+
+/// Dispatch registered API methods asynchronously; leave protocol framing here.
+async fn dispatch_api(value: Value) -> Option<Value> {
+    let Some(obj) = value.as_object() else { return dispatch(value); };
+    let Some(method) = obj.get("method").and_then(Value::as_str) else { return dispatch(value); };
+    let Some(api) = super::apis::websocket(method) else { return dispatch(value); };
+    let id = obj.get("id");
+    let valid_id = id.is_none_or(|v| v.is_null() || v.is_string() || v.is_number());
+    let valid_params = obj.get("params").is_none_or(|v| v.is_object() || v.is_array());
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || !valid_id || !valid_params {
+        return Some(error(id.filter(|_| valid_id).cloned().unwrap_or(Value::Null), -32600, "Invalid Request"));
+    }
+    let result = api.handle(obj.get("params").cloned().unwrap_or(json!({}))).await;
+    // Notifications without IDs are fire-and-forget.
+    id.map(|id| success(id.clone(), if result.is_null() { json!({"status":"okay"}) } else { result }))
+}
+
+pub async fn handle_text_async(text: &str) -> Option<Value> {
+    let value = match serde_json::from_str::<Value>(text) {
+        Ok(value) => value,
+        Err(_) => return Some(error(Value::Null, -32700, "Parse error")),
+    };
+    match value {
+        Value::Array(batch) => {
+            if batch.is_empty() { return Some(error(Value::Null, -32600, "Invalid Request")); }
+            let mut responses = Vec::new();
+            for item in batch { if let Some(response) = dispatch_api(item).await { responses.push(response); } }
+            if responses.is_empty() { None } else { Some(Value::Array(responses)) }
+        }
+        other => dispatch_api(other).await,
+    }
+}

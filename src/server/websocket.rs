@@ -84,7 +84,7 @@ async fn handle_socket(mut socket: WebSocket) {
                             }
                         }
                     }
-                    if let Some(reply) = rpc::handle_text(text.as_str()) {
+                    if let Some(reply) = rpc::handle_text_async(text.as_str()).await {
                         if !send_json(&mut socket, reply).await { break; }
                     }
                 }

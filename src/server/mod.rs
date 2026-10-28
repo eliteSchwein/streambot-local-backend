@@ -1,3 +1,5 @@
+pub mod apis;
+mod api_handlers;
 pub mod rest;
 pub mod response;
 pub mod websocket;
@@ -26,6 +28,7 @@ where F: Future<Output=io::Result<()>> {
 }
 
 pub fn init(config: &crate::config::Config) -> io::Result<ServerService> {
+    api_handlers::register_all().map_err(io::Error::other)?;
     let (exit_tx, exits) = mpsc::unbounded_channel();
     let (rest_stop, rest_rx) = oneshot::channel();
     let rest_config = config.server.clone();
